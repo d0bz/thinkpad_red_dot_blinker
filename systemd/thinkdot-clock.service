@@ -1,0 +1,12 @@
+[Unit]
+Description=ThinkDot Morse Clock Daemon (ThinkPad lid logo dot)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thinkdot.py clock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

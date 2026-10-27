@@ -1,0 +1,2 @@
+# Allow members of the 'video' or 'leds' group (or local users) to control the ThinkPad lid logo dot LED without sudo
+SUBSYSTEM=="leds", KERNEL=="tpacpi::lid_logo_dot", ACTION=="add", RUN+="/bin/chmod 0666 /sys/class/leds/%k/brightness /sys/class/leds/%k/trigger"

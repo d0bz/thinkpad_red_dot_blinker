@@ -1,0 +1,10 @@
+[Unit]
+Description=Blink a Morse greeting on the ThinkPad lid dot at boot
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/thinkdot.py --unit 0.1 morse "system up"
+
+[Install]
+WantedBy=multi-user.target
