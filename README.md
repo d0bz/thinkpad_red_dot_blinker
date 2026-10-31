@@ -12,7 +12,9 @@ Turn your ThinkPad's outer lid LED into a **lid-closed AI agent notification bea
    - Keeps the exterior ThinkPad red dot steadily **ON** during normal operation.
    - When a long-running background task or AI coding agent (such as **Antigravity CLI (`agy`)**) finishes a task or pauses to ask a question, it triggers the alert state (`thinkdot.py trigger`).
    - The red dot on the outside of the lid **blinks continuously**—letting you see from across the room (even when the laptop lid is closed!) that your agent needs your input.
-   - **Auto-dismiss on Lid Open**: As soon as you walk over and **open the laptop lid** (monitored via `/proc/acpi/button/lid/*/state`), or send your next prompt (`thinkdot.py clear`), the blinking automatically stops and returns to a steady glow.
+   - **Auto-dismiss on Lid Open or Desktop Notification Clear**:
+     - **Lid Open**: As soon as you walk over and **open the laptop lid** (monitored via `/proc/acpi/button/lid/*/state`), the blinking automatically stops and returns to a steady glow.
+     - **Desktop Notification Clear**: When you dismiss or click **"Clear"** on the desktop notification (monitored via `org.freedesktop.Notifications` on D-Bus), or send your next prompt (`thinkdot.py clear`), the blinking immediately stops and returns to solid ON.
 
 2. **Morse Code Transmitter (`morse`)**
    - Blinks any text message (`a–z`, `0–9`) in international Morse code on the ThinkPad lid LED.
@@ -101,16 +103,16 @@ sudo thinkdot.py alert
 From any other terminal, script, or hook, trigger or clear the blinking alert:
 
 ```bash
-# Start blinking the lid LED
-thinkdot.py trigger --reason "build_finished"
+# Start blinking the lid LED (and optionally send a tracked desktop notification)
+thinkdot.py trigger --reason "build_finished" --notify "Build finished!"
 
-# Stop blinking manually (or simply close & open the laptop lid!)
+# Stop blinking manually (or simply open the laptop lid / clear the desktop notification!)
 thinkdot.py clear
 ```
 
-**How Lid Detection Works:**
-- If the laptop lid is **closed** when `trigger` is called (or closed while blinking), the outer red dot blinks continuously. The moment you **open the lid**, `thinkdot.py` detects the ACPI lid state transition (`closed` → `open`), clears `/tmp/thinkdot/alert`, and returns the LED to solid ON.
-- If the laptop lid is **already open**, it blinks until either `thinkdot.py clear` is called (e.g., automatically when you submit your next prompt) or the lid is closed and reopened.
+**How Auto-Dismiss Works (Lid Open & Desktop Notification Clear):**
+- **Lid Open**: If the laptop lid is **closed** when `trigger` is called (or closed while blinking), the outer red dot blinks continuously. The moment you **open the lid**, `thinkdot.py` detects the ACPI lid state transition (`closed` → `open`), clears `/tmp/thinkdot/alert`, and returns the LED to solid ON.
+- **Desktop Notification Clear**: While an alert is active, a lightweight background D-Bus watcher listens to `org.freedesktop.Notifications` (`NotificationClosed` / `ActionInvoked`). When you click the notification, click its `×` button, or click **"Clear"** in the desktop notification tray, the alert is automatically cleared and the LED returns to solid ON.
 
 ### 3. Blink Text in Morse Code
 

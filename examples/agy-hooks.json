@@ -9,7 +9,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "python3 -c 'import json,os,subprocess,sys\ntry:\n d=json.loads(sys.stdin.read() or \"{}\")\nexcept Exception:\n d={}\nis_print=False\npid=os.getppid()\nfor _ in range(5):\n if pid<=1: break\n try:\n  args=open(f\"/proc/{pid}/cmdline\",\"rb\").read().split(b\"\\x00\")\n  if args and os.path.basename(args[0])==b\"agy\":\n   is_print=any(a in args for a in (b\"-p\",b\"--print\",b\"--prompt\"))\n   break\n  pid=int(open(f\"/proc/{pid}/stat\",\"rb\").read().rsplit(b\")\",1)[1].split()[1])\n except Exception:\n  break\nif d.get(\"fullyIdle\") is True and d.get(\"terminationReason\")==\"NO_TOOL_CALL\" and not is_print:\n subprocess.run([\"notify-send\",\"-a\",\"Antigravity CLI\",\"Antigravity CLI\",\"Finished and waiting for your input.\"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n subprocess.run([\"/usr/local/bin/thinkdot.py\",\"trigger\",\"--reason\",\"finished\"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\nprint(\"{\\\"decision\\\":\\\"stop\\\"}\")'"
+        "command": "python3 -c 'import json,os,subprocess,sys\ntry:\n d=json.loads(sys.stdin.read() or \"{}\")\nexcept Exception:\n d={}\nis_print=False\npid=os.getppid()\nfor _ in range(5):\n if pid<=1: break\n try:\n  args=open(f\"/proc/{pid}/cmdline\",\"rb\").read().split(b\"\\x00\")\n  if args and os.path.basename(args[0])==b\"agy\":\n   is_print=any(a in args for a in (b\"-p\",b\"--print\",b\"--prompt\"))\n   break\n  pid=int(open(f\"/proc/{pid}/stat\",\"rb\").read().rsplit(b\")\",1)[1].split()[1])\n except Exception:\n  break\nif d.get(\"fullyIdle\") is True and d.get(\"terminationReason\")==\"NO_TOOL_CALL\" and not is_print:\n subprocess.run([\"/usr/local/bin/thinkdot.py\",\"trigger\",\"--reason\",\"finished\",\"--notify\",\"Finished and waiting for your input.\"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\nprint(\"{\\\"decision\\\":\\\"stop\\\"}\")'"
       }
     ],
     "PreToolUse": [
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "notify-send -a 'Antigravity CLI' 'Antigravity CLI' 'Waiting for your answer.' >/dev/null 2>&1 || true; /usr/local/bin/thinkdot.py trigger --reason waiting_answer >/dev/null 2>&1 || true; printf '{\"decision\":\"allow\"}\\n'"
+            "command": "/usr/local/bin/thinkdot.py trigger --reason waiting_answer --notify 'Waiting for your answer.' >/dev/null 2>&1 || true; printf '{\"decision\":\"allow\"}\\n'"
           }
         ]
       }

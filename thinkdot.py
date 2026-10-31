@@ -5,7 +5,7 @@ thinkdot.py — Control the ThinkPad lid-logo red dot LED (tpacpi::lid_logo_dot)
 Supports:
   - AI Agent / Antigravity CLI alert daemon (`alert` / `trigger` / `clear`)
     that stays steadily lit and blinks when attention is needed until the
-    laptop lid is opened.
+    laptop lid is opened OR desktop notifications are cleared/dismissed.
   - Morse code text blinker (`morse`)
   - Morse code minute clock (`clock`)
   - Direct LED control & inspection (`on`, `off`, `status`, `list`)
@@ -14,8 +14,11 @@ Supports:
 import argparse
 import glob
 import os
+import shutil
 import signal
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +32,11 @@ CLOCK_REPEATS = 1
 
 DEFAULT_LID_STATE = os.environ.get("THINKDOT_LID_STATE", "/proc/acpi/button/lid/LID/state")
 DEFAULT_ALERT_FILE = os.environ.get("THINKDOT_ALERT_FILE", "/tmp/thinkdot/alert")
+
+
+def _watcher_pid_file(alert_file=DEFAULT_ALERT_FILE):
+    return os.path.join(os.path.dirname(os.path.abspath(alert_file)), "watcher.pid")
+
 
 MORSE = {
     # Letters
@@ -241,24 +249,223 @@ def ensure_alert_dir(alert_file=DEFAULT_ALERT_FILE):
             pass
 
 
-def trigger_alert(reason="alert", alert_file=DEFAULT_ALERT_FILE):
+def _stop_existing_watcher(alert_file=DEFAULT_ALERT_FILE):
+    pid_file = _watcher_pid_file(alert_file)
+    if not os.path.exists(pid_file):
+        return
+    try:
+        pid = int(read_file(pid_file).strip())
+        if pid != os.getpid():
+            os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+    try:
+        os.remove(pid_file)
+    except OSError:
+        pass
+
+
+def _resolve_session_dbus():
+    """
+    Find the desktop session D-Bus address and target UID (if running as root).
+    Returns (env_dict, target_uid_or_None).
+    """
+    env = os.environ.copy()
+    addr = env.get("DBUS_SESSION_BUS_ADDRESS")
+    if addr:
+        return env, None
+
+    uid = os.getuid()
+    user_bus = f"/run/user/{uid}/bus"
+    if uid != 0 and os.path.exists(user_bus):
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={user_bus}"
+        return env, None
+
+    # If running as root, inspect /run/user/*/bus for an active desktop session
+    for bus_path in sorted(glob.glob("/run/user/*/bus")):
+        try:
+            bus_uid = int(bus_path.split("/")[3])
+            if bus_uid > 0:
+                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+                return env, bus_uid if uid == 0 else None
+        except (IndexError, ValueError):
+            continue
+
+    return None, None
+
+
+def spawn_dbus_watcher(alert_file=DEFAULT_ALERT_FILE, notify_id=None):
+    """
+    Spawn a detached background process that listens for desktop notification
+    dismissal/clearing over D-Bus and clears the alert when detected.
+    """
+    if not shutil.which("dbus-monitor"):
+        return
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "watch-dbus",
+        "--alert-file",
+        os.path.abspath(alert_file),
+    ]
+    if notify_id is not None:
+        cmd.extend(["--notify-id", str(notify_id)])
+
+    try:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def watch_dbus_notifications(alert_file=DEFAULT_ALERT_FILE, notify_id=None):
+    """
+    Watch org.freedesktop.Notifications on the session D-Bus while the alert file
+    is active. If the user clears/dismisses notifications on the desktop
+    (NotificationClosed with reason=2 or matching notify_id, or ActionInvoked),
+    automatically clear the alert file so the LED returns to solid ON.
+    """
+    if not os.path.exists(alert_file):
+        return
+
+    _stop_existing_watcher(alert_file)
+    pid_file = _watcher_pid_file(alert_file)
+    try:
+        write_file(pid_file, f"{os.getpid()}\n")
+        os.chmod(pid_file, 0o666)
+    except OSError:
+        pass
+
+    env, target_uid = _resolve_session_dbus()
+    if not env or not shutil.which("dbus-monitor"):
+        return
+
+    dbus_cmd = [
+        "dbus-monitor",
+        "--session",
+        "type='signal',interface='org.freedesktop.Notifications'",
+    ]
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "text": True,
+        "env": env,
+    }
+    if target_uid is not None and os.geteuid() == 0:
+        popen_kwargs["user"] = target_uid
+
+    try:
+        mon = subprocess.Popen(dbus_cmd, **popen_kwargs)
+    except Exception:
+        return
+
+    dismissed = threading.Event()
+
+    def _reader():
+        mode = None
+        uint_vals = []
+        for raw_line in mon.stdout:
+            line = raw_line.strip()
+            if "interface=org.freedesktop.Notifications" in line:
+                if "member=NotificationClosed" in line:
+                    mode = "closed"
+                    uint_vals = []
+                elif "member=ActionInvoked" in line:
+                    mode = "action"
+                    uint_vals = []
+                else:
+                    mode = None
+            elif mode == "closed" and line.startswith("uint32 "):
+                try:
+                    uint_vals.append(int(line.split()[1]))
+                except (IndexError, ValueError):
+                    mode = None
+                    continue
+                if len(uint_vals) >= 2:
+                    closed_id, reason = uint_vals[0], uint_vals[1]
+                    mode = None
+                    # reason == 2: dismissed/cleared by user on desktop
+                    # reason == 3: closed via CloseNotification for the tracked notification
+                    if reason == 2 or (notify_id is not None and closed_id == notify_id and reason in (2, 3)):
+                        dismissed.set()
+                        break
+            elif mode == "action" and line.startswith("uint32 "):
+                try:
+                    invoked_id = int(line.split()[1])
+                except (IndexError, ValueError):
+                    mode = None
+                    continue
+                mode = None
+                if notify_id is None or invoked_id == notify_id:
+                    dismissed.set()
+                    break
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    try:
+        while os.path.exists(alert_file) and mon.poll() is None:
+            if dismissed.wait(timeout=0.2):
+                clear_alert(alert_file)
+                break
+    finally:
+        try:
+            mon.terminate()
+            mon.wait(timeout=1.0)
+        except Exception:
+            try:
+                mon.kill()
+            except Exception:
+                pass
+        try:
+            if os.path.exists(pid_file) and read_file(pid_file).strip() == str(os.getpid()):
+                os.remove(pid_file)
+        except Exception:
+            pass
+
+
+def trigger_alert(reason="alert", alert_file=DEFAULT_ALERT_FILE,
+                  notify_id=None, notify_message=None, notify_title="Antigravity CLI"):
     """Signal that an agent/process is waiting for an answer or has finished."""
     ensure_alert_dir(alert_file)
-    write_file(alert_file, f"{time.time()}:{reason}\n")
+
+    if notify_message and shutil.which("notify-send"):
+        try:
+            out = subprocess.check_output(
+                ["notify-send", "-p", "-a", notify_title, notify_title, notify_message],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            if out.isdigit():
+                notify_id = int(out)
+        except Exception:
+            pass
+
+    payload = f"{time.time()}:{reason}" + (f":{notify_id}" if notify_id is not None else "") + "\n"
+    write_file(alert_file, payload)
     try:
         os.chmod(alert_file, 0o666)
     except OSError:
         pass
 
+    spawn_dbus_watcher(alert_file=alert_file, notify_id=notify_id)
+
 
 def clear_alert(alert_file=DEFAULT_ALERT_FILE):
-    """Clear the active alert flag."""
+    """Clear the active alert flag and stop any background D-Bus watcher."""
     try:
         os.remove(alert_file)
     except FileNotFoundError:
         pass
     except OSError:
         pass
+    _stop_existing_watcher(alert_file)
 
 
 def get_alert_mtime(alert_file=DEFAULT_ALERT_FILE):
@@ -268,12 +475,24 @@ def get_alert_mtime(alert_file=DEFAULT_ALERT_FILE):
         return None
 
 
+def _is_watcher_alive(alert_file=DEFAULT_ALERT_FILE):
+    pid_file = _watcher_pid_file(alert_file)
+    if not os.path.exists(pid_file):
+        return False
+    try:
+        pid = int(read_file(pid_file).strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
 def run_alert(led_path, blink_interval=DEFAULT_BLINK_INTERVAL,
               lid_state_path=DEFAULT_LID_STATE, alert_file=DEFAULT_ALERT_FILE):
     """
     Keep the LED stable ON. When an alert is triggered (e.g. Antigravity CLI waiting
     for an answer or finished), blink the LED continuously until the laptop lid is
-    opened or the alert is cleared.
+    opened, desktop notifications are cleared, or the alert is cleared.
     """
     ensure_led(led_path)
     ensure_alert_dir(alert_file)
@@ -293,6 +512,8 @@ def run_alert(led_path, blink_interval=DEFAULT_BLINK_INTERVAL,
                     blinking = True
                     last_mtime = mtime
                     saw_closed = not lid_open
+                    if not _is_watcher_alive(alert_file):
+                        spawn_dbus_watcher(alert_file=alert_file)
                 else:
                     if not lid_open:
                         saw_closed = True
@@ -380,7 +601,8 @@ def show_status(led_path, lid_state_path=DEFAULT_LID_STATE, alert_file=DEFAULT_A
             raw = read_file(alert_file).strip()
         except Exception:
             raw = "active"
-        print(f"Alert state:    ACTIVE ({raw}) [{alert_file}]")
+        watcher = "running" if _is_watcher_alive(alert_file) else "stopped"
+        print(f"Alert state:    ACTIVE ({raw}, dbus-watcher={watcher}) [{alert_file}]")
     else:
         print(f"Alert state:    inactive [{alert_file}]")
 
@@ -408,7 +630,7 @@ def main():
                    help="Number of times to repeat HHMM each minute (default: %(default)s)")
 
     a = sub.add_parser("alert", aliases=["agy"],
-                       help="Stay stable on; blink when alerted until laptop lid is opened.")
+                       help="Stay stable on; blink when alerted until lid is opened or notification is cleared.")
     a.add_argument("--interval", type=float, default=DEFAULT_BLINK_INTERVAL,
                    help="Blink interval in seconds (default: %(default)s)")
     a.add_argument("--lid-state", default=DEFAULT_LID_STATE,
@@ -420,10 +642,22 @@ def main():
     t.add_argument("--reason", default="agy", help="Reason for the alert (default: %(default)s)")
     t.add_argument("--alert-file", default=DEFAULT_ALERT_FILE,
                    help="Alert state file path (default: %(default)s)")
+    t.add_argument("--notify", dest="notify_message", default=None,
+                   help="Optional desktop notification message to send and track")
+    t.add_argument("--notify-title", default="Antigravity CLI",
+                   help="Desktop notification title when --notify is used (default: %(default)s)")
+    t.add_argument("--notify-id", type=int, default=None,
+                   help="Optional notification ID from notify-send -p to track")
 
     cl = sub.add_parser("clear", help="Clear the alert blinking state.")
     cl.add_argument("--alert-file", default=DEFAULT_ALERT_FILE,
                     help="Alert state file path (default: %(default)s)")
+
+    w = sub.add_parser("watch-dbus", help="Internal helper: watch D-Bus for notification dismissal.")
+    w.add_argument("--alert-file", default=DEFAULT_ALERT_FILE,
+                   help="Alert state file path (default: %(default)s)")
+    w.add_argument("--notify-id", type=int, default=None,
+                   help="Optional notification ID to track")
 
     sub.add_parser("on", help="Turn the LED steadily ON.")
     sub.add_parser("off", help="Turn the LED OFF.")
@@ -447,9 +681,17 @@ def main():
             run_alert(args.led, blink_interval=args.interval,
                       lid_state_path=args.lid_state, alert_file=args.alert_file)
         elif args.cmd == "trigger":
-            trigger_alert(reason=args.reason, alert_file=args.alert_file)
+            trigger_alert(
+                reason=args.reason,
+                alert_file=args.alert_file,
+                notify_id=args.notify_id,
+                notify_message=args.notify_message,
+                notify_title=args.notify_title,
+            )
         elif args.cmd == "clear":
             clear_alert(alert_file=args.alert_file)
+        elif args.cmd == "watch-dbus":
+            watch_dbus_notifications(alert_file=args.alert_file, notify_id=args.notify_id)
         elif args.cmd == "on":
             ensure_led(args.led)
             led_on(args.led)
